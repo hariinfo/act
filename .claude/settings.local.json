@@ -1,0 +1,25 @@
+{
+
+"model": "opus",
+
+"askBeforeRunningTool": false,
+
+"permissions": {
+
+"allow": [
+
+"Read(*)",
+
+"Search(*)",
+
+"Edit(*)",
+
+"Write(*)",
+
+"Bash(*)"
+
+]
+
+}
+
+}
