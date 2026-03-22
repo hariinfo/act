@@ -57,7 +57,7 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
-The API will be available at `http://localhost:8000`. API docs at `http://localhost:8000/docs`.
+The API will be available at http://localhost:8000. API docs at http://localhost:8000/docs.
 
 ### 3. Frontend
 
@@ -71,7 +71,7 @@ npm install
 npm run dev
 ```
 
-The app will be available at `http://localhost:3000`.
+The app will be available at http://localhost:3000.
 
 ## Usage
 
