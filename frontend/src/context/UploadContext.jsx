@@ -44,6 +44,7 @@ export function UploadProvider({ children }) {
       const formData = new FormData();
       formData.append('file', file);
       if (sourceTest) formData.append('source_test', sourceTest);
+      if (options.pdfType) formData.append('pdf_type', options.pdfType);
       if (options.sectionsFilter) formData.append('sections_filter', options.sectionsFilter);
       if (options.skipTopics) formData.append('skip_topics', 'true');
       if (options.skipExplanations) formData.append('skip_explanations', 'true');

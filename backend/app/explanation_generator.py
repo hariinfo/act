@@ -80,7 +80,10 @@ def _explain_single(section_name: str, q: dict) -> str:
         if val:
             opts.append(f"{labels[j]}. {val[:100]}")
     opts_str = "\n".join(opts)
-    correct = q.get("correct_answer", "?")
+    correct = q.get("correct_answer") or "?"
+    if correct == "?":
+        logger.info(f"[Explanation]   SKIP: no correct answer known for this question")
+        return None
     passage_hint = ""
     if q.get("passage_text"):
         passage_hint = f"\nPassage context: {q['passage_text'][:300]}..."

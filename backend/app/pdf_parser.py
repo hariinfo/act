@@ -1,7 +1,166 @@
 import re
 import base64
 import io
+import logging
+import shutil
 import fitz  # PyMuPDF
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# OCR support for scanned/image-based PDFs
+# ---------------------------------------------------------------------------
+_ocr_cache = {}   # pg_idx -> {'text': str, 'blocks': list}
+_is_scanned = False
+
+
+def _init_ocr():
+    """Reset OCR state at the start of each parse call."""
+    global _ocr_cache, _is_scanned
+    _ocr_cache = {}
+    _is_scanned = False
+
+
+def _detect_scanned_pdf(doc):
+    """Check if the PDF is image-based (no extractable text)."""
+    global _is_scanned
+    for i in range(min(5, len(doc))):
+        if doc[i].get_text().strip():
+            _is_scanned = False
+            return
+    _is_scanned = True
+    logger.info("[OCR] Detected scanned/image-based PDF — will use OCR")
+
+
+def _ocr_page(page):
+    """OCR a single page and cache both plain text and block structure."""
+    pg_idx = page.number
+    if pg_idx in _ocr_cache:
+        return
+
+    try:
+        from PIL import Image
+        import pytesseract
+    except ImportError:
+        logger.warning("[OCR] pytesseract or Pillow not installed — cannot OCR scanned PDF")
+        _ocr_cache[pg_idx] = {'text': '', 'col_text': '', 'blocks': []}
+        return
+
+    tesseract_cmd = shutil.which('tesseract')
+    if not tesseract_cmd:
+        import os
+        for p in [r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+                  r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe']:
+            if os.path.isfile(p):
+                tesseract_cmd = p
+                break
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    dpi = 300
+    pix = page.get_pixmap(dpi=dpi)
+    img = Image.open(io.BytesIO(pix.tobytes('png')))
+    pw = page.rect.width
+    scale = float(dpi) / 72.0  # pixel-to-PDF-point conversion
+    col_mid_px = int(pw * 0.5 * scale)
+
+    # Full-page OCR for plain text (needed for section detection, answer key, etc.)
+    text = pytesseract.image_to_string(img)
+
+    # Column-aware OCR: OCR left and right halves separately to avoid
+    # column interleaving that breaks question detection
+    w, h = img.size
+    left_img = img.crop((0, 0, col_mid_px + 30, h))
+    right_img = img.crop((col_mid_px - 30, 0, w, h))
+
+    left_text = pytesseract.image_to_string(left_img, config='--psm 4')
+    right_text = pytesseract.image_to_string(right_img, config='--psm 4')
+    col_text = left_text + "\n\n" + right_text
+
+    # Build block structure from column-specific word data
+    result_blocks = []
+    for col_label, col_img, x_offset in [('L', left_img, 0), ('R', right_img, col_mid_px - 30)]:
+        data = pytesseract.image_to_data(col_img, output_type=pytesseract.Output.DICT, config='--psm 4')
+        blocks_by_num = {}
+        for i in range(len(data['text'])):
+            word = data['text'][i]
+            if not word.strip():
+                continue
+            block_num = data['block_num'][i]
+            line_num = data['line_num'][i]
+
+            x0 = (data['left'][i] + x_offset) / scale
+            y0 = data['top'][i] / scale
+            x1 = (data['left'][i] + data['width'][i] + x_offset) / scale
+            y1 = (data['top'][i] + data['height'][i]) / scale
+
+            if block_num not in blocks_by_num:
+                blocks_by_num[block_num] = {'lines': {}, 'bbox': [9999, 9999, 0, 0]}
+            blk = blocks_by_num[block_num]
+            blk['bbox'] = [
+                min(blk['bbox'][0], x0), min(blk['bbox'][1], y0),
+                max(blk['bbox'][2], x1), max(blk['bbox'][3], y1),
+            ]
+
+            if line_num not in blk['lines']:
+                blk['lines'][line_num] = {'spans': [], 'bbox': [9999, 9999, 0, 0]}
+            ln = blk['lines'][line_num]
+            ln['bbox'] = [
+                min(ln['bbox'][0], x0), min(ln['bbox'][1], y0),
+                max(ln['bbox'][2], x1), max(ln['bbox'][3], y1),
+            ]
+            ln['spans'].append({
+                'text': word + ' ',
+                'bbox': (x0, y0, x1, y1),
+                'size': y1 - y0,
+                'flags': 0,
+                'font': 'OCR',
+            })
+
+        for bnum in sorted(blocks_by_num):
+            blk = blocks_by_num[bnum]
+            lines_list = []
+            for lnum in sorted(blk['lines']):
+                ln = blk['lines'][lnum]
+                lines_list.append({
+                    'spans': ln['spans'],
+                    'bbox': tuple(ln['bbox']),
+                    'wmode': 0,
+                    'dir': (1.0, 0.0),
+                })
+            result_blocks.append({
+                'type': 0,
+                'bbox': tuple(blk['bbox']),
+                'lines': lines_list,
+            })
+
+    _ocr_cache[pg_idx] = {'text': text, 'col_text': col_text, 'blocks': result_blocks}
+
+
+def _get_page_text(page):
+    """Get page text with OCR fallback for scanned PDFs."""
+    if not _is_scanned:
+        return page.get_text()
+    _ocr_page(page)
+    return _ocr_cache.get(page.number, {}).get('text', '')
+
+
+def _get_page_col_text(page):
+    """Get column-aware OCR text (left col + right col, no interleaving).
+    Falls back to regular page text for non-scanned PDFs."""
+    if not _is_scanned:
+        return page.get_text()
+    _ocr_page(page)
+    return _ocr_cache.get(page.number, {}).get('col_text', '')
+
+
+def _get_page_blocks(page):
+    """Get page text blocks with OCR fallback for scanned PDFs."""
+    if not _is_scanned:
+        return page.get_text("dict")["blocks"]
+    _ocr_page(page)
+    return _ocr_cache.get(page.number, {}).get('blocks', [])
+
 
 # ACT section headers as they appear in PDFs
 SECTION_PATTERNS = [
@@ -147,8 +306,8 @@ def _extract_page_questions(page, page_num):
     Extract question positions and text from a single page using text blocks.
     Returns list of question dicts with their y-position on the page.
     """
-    blocks = page.get_text("dict")["blocks"]
-    text = page.get_text()
+    blocks = _get_page_blocks(page)
+    text = _get_page_text(page)
     questions = []
 
     # Find question number positions using text search
@@ -180,11 +339,15 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(doc)
 
+    # Detect scanned/image-based PDF and set up OCR if needed
+    _init_ocr()
+    _detect_scanned_pdf(doc)
+
     # Step 1: Detect section boundaries
     sections_raw = []
     for pg_idx in range(total_pages):
         page = doc[pg_idx]
-        text = page.get_text()
+        text = _get_page_text(page)
         for pattern, section_name in SECTION_PATTERNS:
             if re.search(pattern, text):
                 # Check for duplicates
@@ -203,19 +366,20 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
             # Find "END OF TEST" to determine last page
             end_page = total_pages - 1
             for pg_idx in range(sec["start_page"], total_pages):
-                text = doc[pg_idx].get_text()
+                text = _get_page_text(doc[pg_idx])
                 if re.search(r'END\s+OF\s+TEST\s+\d', text) or re.search(r'STOP!\s+DO\s+NOT', text):
                     end_page = pg_idx
                     break
             sec["end_page"] = end_page
 
     if not sections_raw:
+        text_preview = _get_page_text(doc[0])[:2000] if total_pages > 0 else ""
         doc.close()
         return {
             "sections": [],
             "total_pages": total_pages,
             "total_questions": 0,
-            "text_preview": doc[0].get_text()[:2000] if total_pages > 0 else "",
+            "text_preview": text_preview,
         }
 
     # Step 2: For each section, parse questions, extract figures and passages
@@ -230,7 +394,7 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
 
         for pg_idx in range(sec["start_page"], sec["end_page"] + 1):
             page = doc[pg_idx]
-            page_text = page.get_text()
+            page_text = _get_page_text(page)
             pw = page.rect.width
             ph = page.rect.height
 
@@ -261,8 +425,9 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
                         "x1": fig["x1"],
                     })
 
-            # Parse questions from this page
-            page_questions = _parse_page_questions(page, page_text, pg_idx + 1, section_name=sec["name"])
+            # Parse questions from this page (use column-aware text for better detection)
+            q_parse_text = _get_page_col_text(page) if _is_scanned else page_text
+            page_questions = _parse_page_questions(page, q_parse_text, pg_idx + 1, section_name=sec["name"])
 
             # Associate figures with questions
             for q in page_questions:
@@ -333,6 +498,7 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
         # Render question images for Math section (preserves notation)
         # Also render for Science questions that have diagrams/figures nearby
         if sec["name"] == "Math":
+            _extract_math_shared_info(doc, section_questions, sec["start_page"], sec["end_page"])
             _render_question_images(doc, section_questions, sec["start_page"], sec["end_page"])
 
         # Remove position metadata from output
@@ -369,14 +535,14 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
     answer_key_text = ""
     for pg_idx in range(max(0, total_pages - 10), total_pages):
         page = doc[pg_idx]
-        text = page.get_text()
+        text = _get_page_text(page)
         if re.search(r'(?:Correct\s*Answer|Answer\s*Key|ANSWER\s*KEY)', text, re.IGNORECASE):
             answer_key_text += f"\n=== PAGE {pg_idx + 1} ===\n{text}"
 
     # Text preview from first few pages
     preview_text = ""
     for i in range(min(3, total_pages)):
-        preview_text += doc[i].get_text() + "\n"
+        preview_text += _get_page_text(doc[i]) + "\n"
 
     doc.close()
 
@@ -442,7 +608,7 @@ def _find_passage_clip_rect(page, section_name, is_first_page, y_clip_min=None, 
         # Left column: from left edge to about 48% of page width
         # Skip header bar (top ~90 pts) and footer (bottom ~35 pts)
         # Find actual content bounds
-        blocks = page.get_text("dict")["blocks"]
+        blocks = _get_page_blocks(page)
         col_boundary = pw * 0.48
         min_y = ph
         max_y = 0
@@ -504,7 +670,7 @@ def _find_passage_clip_rect(page, section_name, is_first_page, y_clip_min=None, 
         # Reading/Science: full width passage area above questions
         # Some passages span two columns: passage text in left AND right columns,
         # with questions only in the right column below the passage continuation.
-        blocks = page.get_text("dict")["blocks"]
+        blocks = _get_page_blocks(page)
         first_question_y = ph
         passage_start_y = None
         max_passage_bottom_y = 0
@@ -693,11 +859,11 @@ def _extract_passages(doc, start_page, end_page, section_name):
     passage_locs = []
     for pg_idx in range(start_page, end_page + 1):
         page = doc[pg_idx]
-        text = page.get_text()
+        text = _get_page_text(page)
         for m in PASSAGE_MARKER.finditer(text):
             # Find the y-position of this passage marker on the page
             marker_y = None
-            blocks = page.get_text("dict")["blocks"]
+            blocks = _get_page_blocks(page)
             for b in blocks:
                 if b["type"] != 0:
                     continue
@@ -826,7 +992,7 @@ def _extract_left_column_text(page, is_first_page):
     Extract text from the left column of an English section page.
     The passage text is on the left (x < ~300), questions on the right.
     """
-    blocks = page.get_text("dict")["blocks"]
+    blocks = _get_page_blocks(page)
     pw = page.rect.width
     mid_x = pw * 0.52  # Approximate column boundary
 
@@ -899,7 +1065,7 @@ def _extract_passage_text_before_questions(page, is_first_page):
     Extract passage/experiment text from Reading/Science pages.
     These have passage text in the upper portion and questions below.
     """
-    blocks = page.get_text("dict")["blocks"]
+    blocks = _get_page_blocks(page)
     passage_parts = []
     title = ""
     found_passage_marker = False
@@ -1092,37 +1258,62 @@ def _parse_page_questions(page, page_text, page_num, section_name=None):
 
         # Try to parse options
         q = _parse_question_block(q_num, block_text, page_num)
+
+        # For Math questions with graphical answer options (e.g. graphs for
+        # each choice), text option parsing fails.  Create a stub question
+        # so the image renderer can still capture the visual options.
+        if q is None and section_name == "Mathematics" and len(clean.strip()) > 20:
+            uses_fghj = q_num % 2 == 0
+            q = {
+                "question_number": q_num,
+                "question_text": " ".join(clean.split()),
+                "correct_answer": None,
+                "option_labels": "FGHJK" if uses_fghj else "ABCDE",
+                "option_a": "(see image)" if not uses_fghj else "(see image)",
+                "option_b": "(see image)",
+                "option_c": "(see image)",
+                "option_d": "(see image)",
+                "option_e": "(see image)",
+                "passage_text": None,
+                "question_image": None,
+                "difficulty": 3,
+            }
+            logger.info(f"[MathGraphQ] Q{q_num} has graphical options — created stub question")
+
         if q:
             # Find y position by scanning text blocks for lines starting with "N."
             # This is more reliable than page.search_for which can match
             # question numbers embedded in option text (e.g. "289" matching "2.")
-            header_threshold = page.rect.height * 0.22
             left_half = page.rect.width * 0.5
             q_pattern = re.compile(rf'^\s*{q_num}\.\s')
             found_pos = False
 
-            blocks = page.get_text("dict")["blocks"]
-            for b in blocks:
-                if b["type"] != 0:
-                    continue
-                bx0, by0 = b["bbox"][0], b["bbox"][1]
-                # Must be below header
-                if by0 < header_threshold:
-                    continue
-                # English questions are in the right column; others in the left
-                if section_name != "English" and bx0 > left_half:
-                    continue
-                # Check if block text starts with the question number
-                block_text = ""
-                for bline in b["lines"]:
-                    for span in bline["spans"]:
-                        block_text += span["text"]
-                block_text = block_text.strip()
-                if q_pattern.match(block_text):
-                    q["y_pos"] = by0
-                    q["x_pos"] = bx0
-                    found_pos = True
+            blocks = _get_page_blocks(page)
+            # Two-pass: first with standard header threshold, then relaxed
+            for header_threshold in [page.rect.height * 0.22, page.rect.height * 0.08]:
+                if found_pos:
                     break
+                for b in blocks:
+                    if b["type"] != 0:
+                        continue
+                    bx0, by0 = b["bbox"][0], b["bbox"][1]
+                    # Must be below header
+                    if by0 < header_threshold:
+                        continue
+                    # English questions are in the right column; others in the left
+                    if section_name != "English" and bx0 > left_half:
+                        continue
+                    # Check if block text starts with the question number
+                    block_text = ""
+                    for bline in b["lines"]:
+                        for span in bline["spans"]:
+                            block_text += span["text"]
+                    block_text = block_text.strip()
+                    if q_pattern.match(block_text):
+                        q["y_pos"] = by0
+                        q["x_pos"] = bx0
+                        found_pos = True
+                        break
 
             if not found_pos:
                 # Fallback: use search_for with stricter filtering
@@ -1249,12 +1440,20 @@ def _parse_question_block(q_num, text, page_num):
     # Clean up question text
     q_text = re.sub(r'\s+', ' ', q_text).strip()
 
-    # Determine if this question uses F/G/H/J/K labels (ACT even-numbered questions)
-    uses_fghj = any(k in opts for k in 'FGHJK')
+    # ACT uses alternating labels: odd questions = A/B/C/D/E, even = F/G/H/J/K.
+    # Use question number parity as the authority for display labels.
+    # Use the actually parsed letters for value extraction.
+    expected_fghj = q_num % 2 == 0
+    parsed_fghj = any(k in opts for k in 'FGHJK')
 
-    # Store options positionally (option_a=first, option_b=second, etc.)
-    # but preserve original labels for display
-    if uses_fghj:
+    # Labels for extracting values from opts dict
+    if parsed_fghj:
+        extract_labels = ['F', 'G', 'H', 'J', 'K']
+    else:
+        extract_labels = ['A', 'B', 'C', 'D', 'E']
+
+    # Labels for display (based on question number, the authoritative source)
+    if expected_fghj:
         labels = ['F', 'G', 'H', 'J', 'K']
     else:
         labels = ['A', 'B', 'C', 'D', 'E']
@@ -1264,24 +1463,120 @@ def _parse_question_block(q_num, text, page_num):
         opts[k] = re.sub(r'\s+', ' ', opts[k]).strip()
 
     # Map positionally: option_a = first label's value, etc.
+    # Use extract_labels for lookup (matches parsed PDF letters),
+    # display labels (from question number parity) for option_labels.
     positional = ['option_a', 'option_b', 'option_c', 'option_d', 'option_e']
     result = {
         "question_number": q_num,
         "question_text": q_text,
         "correct_answer": None,
-        "option_labels": "FGHJK" if uses_fghj else "ABCDE",
+        "option_labels": "FGHJK" if expected_fghj else "ABCDE",
         "passage_text": None,
         "question_image": None,
         "difficulty": 3,
     }
-    for i, label in enumerate(labels):
+    for i, ext_label in enumerate(extract_labels):
         field = positional[i]
         if i < 4:  # option_a through option_d are required
-            result[field] = opts.get(label, "")
+            result[field] = opts.get(ext_label, "")
         else:  # option_e is optional
-            result[field] = opts.get(label)
+            result[field] = opts.get(ext_label)
 
     return result
+
+
+def _extract_math_shared_info(doc, questions, start_page, end_page):
+    """
+    Detect shared information blocks in Math sections.
+
+    ACT Math sometimes has blocks like:
+        "Use the following information to answer questions 17–19."
+        [paragraph + table/figure]
+    followed by questions 17, 18, 19.
+
+    This function finds those blocks, renders them as images, and attaches
+    them as passage_image to each of the referenced questions.
+    """
+    if not questions:
+        return
+
+    # Build a lookup: question_number -> question dict
+    q_by_num = {q["question_number"]: q for q in questions if q.get("question_number")}
+
+    # Pattern: "Use the following information to answer questions X–Y"
+    # Various dash types: –, -, —, and "through"
+    info_pat = re.compile(
+        r'Use the following information to answer\s+questions?\s+(\d+)\s*[\u2013\u2014\-]+\s*(\d+)',
+        re.IGNORECASE
+    )
+
+    for pg_idx in range(start_page, min(end_page + 1, len(doc))):
+        page = doc[pg_idx]
+        pw = page.rect.width
+        ph = page.rect.height
+        page_text = _get_page_text(page)
+
+        for m in info_pat.finditer(page_text):
+            q_start = int(m.group(1))
+            q_end = int(m.group(2))
+
+            # Find the y-position of the info block header on the page
+            blocks = _get_page_blocks(page)
+            info_y_start = None
+            info_block_bottom = 0
+
+            for b in blocks:
+                if b["type"] != 0:
+                    continue
+                block_text = ""
+                for bline in b["lines"]:
+                    for span in bline["spans"]:
+                        block_text += span["text"]
+                block_text = block_text.strip()
+
+                if "Use the following information" in block_text:
+                    info_y_start = b["bbox"][1]
+
+            if info_y_start is None:
+                continue
+
+            # Find the first referenced question's y_pos to determine where
+            # the info block ends
+            first_q = q_by_num.get(q_start)
+            if not first_q or first_q.get("page_num") != pg_idx + 1:
+                continue
+
+            first_q_y = first_q.get("y_pos", 0)
+
+            # The info block spans from info_y_start to just before first_q_y
+            if first_q_y <= info_y_start:
+                continue
+
+            # Determine x boundaries (left column for math)
+            has_figuring = "DO YOUR FIGURING" in page_text
+            x_left = 36
+            x_right = pw * 0.52 if has_figuring else pw - 36
+
+            # Render the info block as an image
+            clip = fitz.Rect(x_left, max(0, info_y_start - 4), x_right, first_q_y - 4)
+            if clip.height < 20:
+                continue
+
+            try:
+                info_image = _render_region_to_base64(page, clip, scale=5.0)
+            except Exception as e:
+                logger.warning(f"Failed to render shared info block for Q{q_start}-{q_end}: {e}")
+                continue
+
+            # Attach as passage_image to all referenced questions
+            passage_text = f"Use the following information to answer questions {q_start}\u2013{q_end}."
+            for qn in range(q_start, q_end + 1):
+                q = q_by_num.get(qn)
+                if q:
+                    q["passage_image"] = info_image
+                    q["passage_text"] = passage_text
+
+            logger.info(f"[MathSharedInfo] Attached shared info block to Q{q_start}-{q_end} (page {pg_idx + 1})")
 
 
 def _render_question_images(doc, questions, start_page, end_page):
@@ -1319,7 +1614,7 @@ def _render_question_images(doc, questions, start_page, end_page):
         # Math section: questions may be on the left half of the page
         # (right half is "DO YOUR FIGURING HERE")
         # Detect by checking if "DO YOUR FIGURING" text exists
-        page_text = page.get_text()
+        page_text = _get_page_text(page)
         has_figuring_area = "DO YOUR FIGURING" in page_text
 
         # For math pages with figuring area, questions are in left ~52% of page
@@ -1343,7 +1638,7 @@ def _render_question_images(doc, questions, start_page, end_page):
                 # Last question on page: find actual content bottom instead of
                 # extending to page bottom (which captures empty space)
                 last_content_y = q_y_start + 50  # minimum
-                blocks = page.get_text("dict")["blocks"]
+                blocks = _get_page_blocks(page)
                 for b in blocks:
                     if b["type"] != 0:
                         continue
@@ -1406,39 +1701,64 @@ def _extract_answer_key(doc) -> dict[str, dict[int, str]]:
     answer_key = {}  # subject -> {q_num: answer}
 
     # Scan last ~15 pages for scoring key sections
+    # Subject header patterns (match inline while scanning lines)
+    # Formats: "English Test 1 Section", "Test 1: English—Scoring Key", "English Scoring Key"
+    _subj_patterns = [
+        (re.compile(r'English\s+Test\s+1\s+Section|English.{0,3}Scoring\s+Key|Test\s+1.{0,3}English', re.IGNORECASE), 'English'),
+        (re.compile(r'Mathematics\s+Test\s+2\s+Section|Mathematics.{0,3}Scoring\s+Key|Test\s+2.{0,3}Mathematics', re.IGNORECASE), 'Math'),
+        (re.compile(r'Reading\s+Test\s+3\s+Section|Reading.{0,3}Scoring\s+Key|Test\s+3.{0,3}Reading', re.IGNORECASE), 'Reading'),
+        (re.compile(r'Science\s+Test\s+4\s+Section|Science.{0,3}Scoring\s+Key|Test\s+4.{0,3}Science', re.IGNORECASE), 'Science'),
+    ]
+
+    # Reporting category markers that identify which subject's answer block follows.
+    # On shared pages, data may appear: Science Q1-40, then Reading Q1-40
+    # with only the reporting category header row distinguishing them.
+    _cat_markers = {
+        'POW': 'English', 'KLA': 'English', 'CSE': 'English',
+        'PHM': 'Math', 'IES': 'Math',
+        'KID': 'Reading', 'IKI': 'Reading',
+        'IOD': 'Science', 'SIN': 'Science', 'EMI': 'Science',
+    }
+
     for pg_idx in range(max(0, total_pages - 15), total_pages):
         page = doc[pg_idx]
-        text = page.get_text()
+        text = _get_page_text(page)
 
-        # Detect subject from section headers
-        current_subject = None
-        if re.search(r'English\s+Test\s+1\s+Section|English\s+Scoring\s+Key', text, re.IGNORECASE):
-            current_subject = 'English'
-        elif re.search(r'Mathematics\s+Test\s+2\s+Section|Mathematics\s+Scoring\s+Key', text, re.IGNORECASE):
-            current_subject = 'Math'
-        elif re.search(r'Reading\s+Test\s+3\s+Section|Reading\s+Scoring\s+Key', text, re.IGNORECASE):
-            current_subject = 'Reading'
-        elif re.search(r'Science\s+Test\s+4\s+Section|Science\s+Scoring\s+Key', text, re.IGNORECASE):
-            current_subject = 'Science'
-
-        if not current_subject:
+        # Quick check: does this page have any scoring key content?
+        if not re.search(r'Scoring\s+Key|Test\s+\d\s+Section', text, re.IGNORECASE):
             continue
 
-        if current_subject not in answer_key:
-            answer_key[current_subject] = {}
-
-        # Parse the table data from the extracted text.
-        # PyMuPDF extracts each table cell on its own line, so the pattern is:
-        #   number_line, answer_letter_line, reporting_category_line (repeating)
-        # We scan lines looking for: a number (1-75), followed by a single letter line.
+        # Scan lines, switching current_subject when a header is encountered.
+        # This handles pages with multiple subjects (e.g. Reading + Science).
         lines = text.split('\n')
+        current_subject = None
         i = 0
         while i < len(lines):
             line = lines[i].strip()
             i += 1
 
-            # Look for a question number (1-75 as standalone number)
-            num_match = re.match(r'^(\d{1,2})$', line)
+            # Check if this line is a subject header
+            for pat, subj in _subj_patterns:
+                if pat.search(line):
+                    current_subject = subj
+                    if current_subject not in answer_key:
+                        answer_key[current_subject] = {}
+                    break
+
+            # Check for reporting category markers that switch the active subject.
+            # e.g. a line "KID" followed by "CS" and "IKI" means Reading data follows.
+            if line in _cat_markers:
+                new_subj = _cat_markers[line]
+                if new_subj != current_subject:
+                    current_subject = new_subj
+                    if current_subject not in answer_key:
+                        answer_key[current_subject] = {}
+
+            if not current_subject:
+                continue
+
+            # Look for a question number (1-75, with optional trailing period)
+            num_match = re.match(r'^(\d{1,2})\.?$', line)
             if not num_match:
                 continue
 
@@ -1470,10 +1790,177 @@ def _extract_answer_key(doc) -> dict[str, dict[int, str]]:
             if i < len(lines):
                 cat_line = lines[i].strip()
                 # If it's a reporting category (not a number), skip it
-                if not re.match(r'^\d{1,2}$', cat_line):
+                if not re.match(r'^\d{1,2}\.?$', cat_line):
                     i += 1
 
+    # If table-based parsing found nothing, try compact format:
+    # "CORRECT ANSWER EHBFDKBGDJ CGCFCHEHAK ..." (all answers as one string)
+    if not any(answer_key.get(s) for s in ['English', 'Math', 'Reading', 'Science']):
+        _parse_compact_answer_key(doc, answer_key)
+
     return answer_key
+
+
+def _parse_compact_answer_key(doc, answer_key):
+    """
+    Parse compact answer key format found in scanned ACT PDFs.
+    Uses word-level bounding box data to separate multi-column layouts
+    (Math/Reading/Science side by side on the same page).
+    """
+    total_pages = len(doc)
+    subject_expected = {'Math': 60, 'Reading': 40, 'Science': 40, 'English': 75}
+
+    for pg_idx in range(max(0, total_pages - 10), total_pages):
+        page = doc[pg_idx]
+        text = _get_page_text(page)
+        if 'CORRECT' not in text.upper():
+            continue
+
+        # Use OCR word data with positions for column detection
+        blocks = _get_page_blocks(page)
+        if not blocks:
+            continue
+
+        # Collect all words with their positions
+        words = []
+        for b in blocks:
+            if b.get('type', 0) != 0:
+                continue
+            for line in b.get('lines', []):
+                for span in line.get('spans', []):
+                    bbox = span.get('bbox', (0, 0, 0, 0))
+                    words.append({
+                        'text': span['text'].strip(),
+                        'x': bbox[0], 'y': bbox[1],
+                        'x1': bbox[2], 'y1': bbox[3],
+                    })
+
+        # Find subject headers and their "CORRECT ANSWER" y-positions
+        subject_y = {}  # subject_name -> y of "CORRECT ANSWER"
+        for w in words:
+            t = w['text'].upper()
+            if t == 'MATHEMATICS':
+                subject_y['Math'] = None
+            elif t == 'READING':
+                subject_y['Reading'] = None
+            elif t == 'SCIENCE':
+                subject_y['Science'] = None
+
+        # Find "CORRECT" words and match to nearest subject
+        correct_positions = []
+        for w in words:
+            if w['text'].upper() == 'CORRECT':
+                correct_positions.append(w['y'])
+
+        # Sort subjects by their header y-position
+        subject_headers = []
+        for w in words:
+            t = w['text'].upper()
+            if t in ('MATHEMATICS', 'READING', 'SCIENCE'):
+                name = {'MATHEMATICS': 'Math', 'READING': 'Reading', 'SCIENCE': 'Science'}[t]
+                subject_headers.append((w['y'], name))
+        subject_headers.sort()
+
+        # Match each subject to the nearest "CORRECT" y-position
+        for header_y, subj_name in subject_headers:
+            best_y = None
+            best_dist = float('inf')
+            for cy in correct_positions:
+                dist = cy - header_y  # CORRECT should be below header
+                if 0 < dist < 30 and dist < best_dist:
+                    best_dist = dist
+                    best_y = cy
+            if best_y is not None:
+                subject_y[subj_name] = best_y
+
+        # For each subject with a known CORRECT ANSWER y-position,
+        # collect all letter groups at that y (within tolerance)
+        for subj_name, correct_y in subject_y.items():
+            if correct_y is None:
+                continue
+            expected = subject_expected.get(subj_name, 60)
+            y_tolerance = 8
+
+            # Find answer groups: words near correct_y that look like letter sequences
+            answer_words = []
+            for w in words:
+                if abs(w['y'] - correct_y) > y_tolerance:
+                    continue
+                t = w['text'].upper()
+                # Must be mostly A-K letters and at least 5 chars
+                letter_count = sum(1 for c in t if c in 'ABCDEFGHJK')
+                if letter_count >= 5 and letter_count / max(len(t), 1) > 0.7:
+                    answer_words.append((w['x'], t))
+
+            # Sort by x-position and concatenate
+            answer_words.sort()
+            letters = ''
+            for _, word_text in answer_words:
+                letters += re.sub(r'[^A-K]', '', word_text)
+
+            if letters:
+                _store_compact_answers(answer_key, subj_name, expected, letters)
+
+    # Also try parsing sequential single-letter answers from scoring key pages
+    _parse_sequential_answer_key(doc, answer_key)
+
+
+def _store_compact_answers(answer_key, subject, expected_count, letters):
+    """Store compact answer letters into the answer_key dict."""
+    if len(letters) < expected_count * 0.8:
+        return  # Not enough letters, probably misparse
+    letters = letters[:expected_count]
+    if subject not in answer_key:
+        answer_key[subject] = {}
+    for i, ch in enumerate(letters):
+        if ch in 'ABCDEFGHJK':
+            answer_key[subject][i + 1] = ch
+    logger.info(f"[AnswerKey] Compact format: {subject} = {len(answer_key[subject])} answers from {len(letters)} letters")
+
+
+def _parse_sequential_answer_key(doc, answer_key):
+    """
+    Parse scoring key pages where answers are listed as sequential single letters.
+    E.g., page has "Scoring Key" header and then lists letters G, A, J, C, ...
+    one per line, in question order.
+    """
+    total_pages = len(doc)
+    subject_patterns = [
+        (r'English.*Scoring\s+Key', 'English', 75),
+        (r'Mathematics.*Scoring\s+Key', 'Math', 60),
+        (r'Reading.*Scoring\s+Key', 'Reading', 40),
+        (r'Science.*Scoring\s+Key', 'Science', 40),
+    ]
+
+    for pg_idx in range(max(0, total_pages - 15), total_pages):
+        page = doc[pg_idx]
+        text = _get_page_text(page)
+
+        subject = None
+        expected = 0
+        for pat, subj, count in subject_patterns:
+            if re.search(pat, text, re.IGNORECASE):
+                subject = subj
+                expected = count
+                break
+
+        if not subject or subject in answer_key and len(answer_key[subject]) >= expected * 0.8:
+            continue
+
+        # Collect all single-letter lines that are valid answer letters
+        lines = text.split('\n')
+        letters = []
+        for line in lines:
+            s = line.strip()
+            if re.match(r'^[A-KFGHJ]$', s):
+                letters.append(s)
+
+        if len(letters) >= expected * 0.8:
+            if subject not in answer_key:
+                answer_key[subject] = {}
+            for i, ch in enumerate(letters[:expected]):
+                answer_key[subject][i + 1] = ch
+            logger.info(f"[AnswerKey] Sequential format: {subject} = {len(answer_key[subject])} answers")
 
 
 def parse_answer_key(text: str) -> dict[int, str]:

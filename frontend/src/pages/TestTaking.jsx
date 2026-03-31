@@ -311,6 +311,27 @@ export default function TestTaking() {
               overflowY: 'auto',
               padding: '12px 8px',
             }}>
+              {currentQuestion.passage_image && (
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: 'var(--act-dark-gray)',
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.5,
+                    marginBottom: 8,
+                    paddingLeft: 8,
+                  }}>
+                    {currentQuestion.passage_text || 'Shared Information'}
+                  </div>
+                  <img
+                    src={currentQuestion.passage_image}
+                    alt="Shared information"
+                    style={{ maxWidth: '75%', width: '75%', height: 'auto', imageRendering: 'auto', display: 'block', margin: '0 auto' }}
+                  />
+                  <hr style={{ border: 'none', borderTop: '1px solid var(--act-border)', margin: '12px 0' }} />
+                </div>
+              )}
               <img
                 src={currentQuestion.question_image}
                 alt="Question"

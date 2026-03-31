@@ -213,6 +213,21 @@ class TestAttemptOut(BaseModel):
         from_attributes = True
 
 
+class TestAttemptHistoryOut(BaseModel):
+    id: int
+    test_id: int
+    test_name: str
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    score: Optional[float] = None
+    total_correct: int = 0
+    total_questions: int = 0
+    status: str
+
+    class Config:
+        from_attributes = True
+
+
 class AnswerOut(BaseModel):
     id: int
     question_id: int

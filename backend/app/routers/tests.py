@@ -11,7 +11,7 @@ from ..models import (
 )
 from ..schemas import (
     TestCreate, TestOut, TestDetailOut, TestSectionDetailOut,
-    TestAttemptOut, AnswerSubmit, TestResultOut, SectionScore,
+    TestAttemptOut, TestAttemptHistoryOut, AnswerSubmit, TestResultOut, SectionScore,
     QuestionTestTaker, AnswerOut,
 )
 from ..auth import get_current_user, get_admin_user
@@ -158,6 +158,57 @@ def get_my_attempts(
     return attempts
 
 
+@router.get("/my-history", response_model=list[TestAttemptHistoryOut])
+def get_my_history(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    attempts = (
+        db.query(TestAttempt)
+        .options(
+            joinedload(TestAttempt.test).joinedload(Test.sections),
+            joinedload(TestAttempt.answers),
+        )
+        .filter(
+            TestAttempt.user_id == current_user.id,
+            TestAttempt.status == AttemptStatus.completed,
+        )
+        .order_by(TestAttempt.completed_at.desc())
+        .all()
+    )
+    result = []
+    for a in attempts:
+        total_correct = sum(1 for ans in a.answers if ans.is_correct)
+        total_questions = sum(s.num_questions for s in a.test.sections)
+        result.append(TestAttemptHistoryOut(
+            id=a.id,
+            test_id=a.test_id,
+            test_name=a.test.name,
+            started_at=a.started_at,
+            completed_at=a.completed_at,
+            score=a.score,
+            total_correct=total_correct,
+            total_questions=total_questions,
+            status=a.status.value if hasattr(a.status, 'value') else a.status,
+        ))
+    return result
+
+
+@router.delete("/attempts/{attempt_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_attempt(
+    attempt_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    attempt = db.query(TestAttempt).filter(TestAttempt.id == attempt_id).first()
+    if not attempt or attempt.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+    # Delete associated answers first
+    db.query(TestAttemptAnswer).filter(TestAttemptAnswer.attempt_id == attempt_id).delete()
+    db.delete(attempt)
+    db.commit()
+
+
 @router.post("/attempts/{attempt_id}/answer", response_model=AnswerOut)
 def submit_answer(
     attempt_id: int,
@@ -188,10 +239,14 @@ def submit_answer(
     ) if data.selected_answer else None
 
     if existing:
-        existing.selected_answer = data.selected_answer
-        existing.is_correct = is_correct
-        existing.time_spent_seconds = data.time_spent_seconds
-        existing.section_id = data.section_id
+        # Only update fields that are actually provided
+        if data.selected_answer is not None:
+            existing.selected_answer = data.selected_answer
+            existing.is_correct = is_correct
+        if data.time_spent_seconds is not None:
+            existing.time_spent_seconds = data.time_spent_seconds
+        if data.section_id is not None:
+            existing.section_id = data.section_id
         db.commit()
         db.refresh(existing)
         return existing
@@ -509,3 +564,40 @@ def start_test(
     db.commit()
     db.refresh(attempt)
     return attempt
+
+
+@router.post("/{test_id}/restart", response_model=TestAttemptOut)
+def restart_test(
+    test_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Abandon any in-progress attempt and start a fresh one."""
+    test = db.query(Test).filter(Test.id == test_id, Test.is_active == True).first()
+    if not test:
+        raise HTTPException(status_code=404, detail="Test not found")
+
+    # Abandon all in-progress attempts for this test
+    existing = (
+        db.query(TestAttempt)
+        .filter(
+            TestAttempt.test_id == test_id,
+            TestAttempt.user_id == current_user.id,
+            TestAttempt.status == AttemptStatus.in_progress,
+        )
+        .all()
+    )
+    for attempt in existing:
+        attempt.status = AttemptStatus.abandoned
+        attempt.completed_at = datetime.utcnow()
+
+    # Create a new attempt
+    new_attempt = TestAttempt(
+        test_id=test_id,
+        user_id=current_user.id,
+        status=AttemptStatus.in_progress,
+    )
+    db.add(new_attempt)
+    db.commit()
+    db.refresh(new_attempt)
+    return new_attempt

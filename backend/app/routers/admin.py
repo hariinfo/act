@@ -25,6 +25,7 @@ from ..schemas import DashboardStats, SourceInfo, UserOut, QuestionCreate, Quest
 from ..auth import get_admin_user, hash_password, get_current_user
 from ..config import settings
 from ..pdf_parser import parse_act_pdf
+from ..book_parser import parse_act_book_pdf
 from ..topic_classifier import classify_questions
 from ..explanation_generator import generate_explanations
 
@@ -176,10 +177,22 @@ def create_admin_auth(
     return user
 
 
+@router.get("/check-source")
+def check_source_exists(
+    source_test: str,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_admin_user),
+):
+    """Check if a source_test already exists in the database."""
+    count = db.query(Question).filter(Question.source_test == source_test).count()
+    return {"exists": count > 0, "question_count": count}
+
+
 @router.post("/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
     source_test: str = Form(None),
+    pdf_type: str = Form("act_test"),  # "act_test" or "act_book"
     sections_filter: str = Form(None),  # comma-separated: "English,Math"
     skip_topics: bool = Form(False),
     skip_explanations: bool = Form(False),
@@ -188,7 +201,7 @@ async def upload_pdf(
 ):
     """Upload an ACT PDF and parse it into sections with questions and images.
     Returns SSE stream with progress updates, final event contains the full result."""
-    logger.info(f"[Upload] === UPLOAD ENDPOINT HIT === file={file.filename}")
+    logger.info(f"[Upload] === UPLOAD ENDPOINT HIT === file={file.filename}, pdf_type={pdf_type}")
     logger.info(f"[Upload] Options: sections_filter={sections_filter}, skip_topics={skip_topics}, skip_explanations={skip_explanations}")
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF")
@@ -206,12 +219,16 @@ async def upload_pdf(
         # Step 1: Parse PDF
         logger.info("[Upload] Step 1: Parsing PDF...")
         filter_hint = f" (will filter to: {', '.join(allowed_sections)})" if allowed_sections else ""
-        yield f"data: {json.dumps({'step': 'parsing', 'message': f'Waiting to parse PDF...{filter_hint}'})}\n\n"
+        parser_label = "ACT prep book" if pdf_type == "act_book" else "ACT practice test"
+        yield f"data: {json.dumps({'step': 'parsing', 'message': f'Waiting to parse {parser_label}...{filter_hint}'})}\n\n"
         # Serialize PDF parsing — PyMuPDF segfaults under concurrent use
         _pdf_parse_lock.acquire()
         try:
-            yield f"data: {json.dumps({'step': 'parsing', 'message': f'Parsing PDF pages...{filter_hint}'})}\n\n"
-            result = parse_act_pdf(content)
+            yield f"data: {json.dumps({'step': 'parsing', 'message': f'Parsing {parser_label} pages...{filter_hint}'})}\n\n"
+            if pdf_type == "act_book":
+                result = parse_act_book_pdf(content)
+            else:
+                result = parse_act_pdf(content)
         finally:
             _pdf_parse_lock.release()
         result["filename"] = file.filename
@@ -297,8 +314,8 @@ async def upload_pdf(
                     yield evt
                 pending_events.clear()
 
-            logger.info(f"[Upload] {sec_name}: {explained_count}/{sec_q_count} explanations generated")
-            yield f"data: {json.dumps({'step': 'explained', 'message': f'{sec_name}: {explained_count}/{sec_q_count} explanations generated', 'section_index': i, 'total_sections': total_sections})}\n\n"
+                logger.info(f"[Upload] {sec_name}: {explained_count}/{sec_q_count} explanations generated")
+                yield f"data: {json.dumps({'step': 'explained', 'message': f'{sec_name}: {explained_count}/{sec_q_count} explanations generated', 'section_index': i, 'total_sections': total_sections})}\n\n"
 
         # Step 4: Done - send the full result
         logger.info("[Upload] Step 4: Done! Sending result...")

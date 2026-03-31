@@ -9,7 +9,7 @@ export default function TestResults() {
   const [results, setResults] = useState(null);
   const [test, setTest] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [showReview, setShowReview] = useState(false);
+  const [showReview, setShowReview] = useState(true);
   const [reviewQuestions, setReviewQuestions] = useState([]);
 
   useEffect(() => {
@@ -31,6 +31,7 @@ export default function TestResults() {
               selectedAnswer: answer?.selected_answer,
               isCorrect: answer?.is_correct,
               correct_answer: answer?.correct_answer || q.correct_answer,
+              time_spent_seconds: answer?.time_spent_seconds,
             });
           }
         }
@@ -100,17 +101,28 @@ export default function TestResults() {
                 showResult={true}
                 correctAnswer={q.correct_answer || null}
               />
-              {!q.selectedAnswer && (
-                <div style={{
-                  marginTop: 12,
-                  marginLeft: 48,
-                  color: 'var(--act-orange)',
-                  fontSize: 14,
-                  fontWeight: 600,
-                }}>
-                  Not answered
-                </div>
-              )}
+              <div style={{ display: 'flex', gap: 16, marginTop: 12, marginLeft: 48 }}>
+                {!q.selectedAnswer && (
+                  <span style={{
+                    color: 'var(--act-orange)',
+                    fontSize: 14,
+                    fontWeight: 600,
+                  }}>
+                    Not answered
+                  </span>
+                )}
+                {q.time_spent_seconds != null && q.time_spent_seconds > 0 && (
+                  <span style={{
+                    fontSize: 13,
+                    color: '#888',
+                    fontStyle: 'italic',
+                  }}>
+                    Time: {q.time_spent_seconds >= 60
+                      ? `${Math.floor(q.time_spent_seconds / 60)}m ${q.time_spent_seconds % 60}s`
+                      : `${q.time_spent_seconds}s`}
+                  </span>
+                )}
+              </div>
             </div>
           ))}
         </div>
