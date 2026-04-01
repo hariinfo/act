@@ -129,6 +129,13 @@ export default function AdminDashboard() {
         </div>
       </div>
 
+      {/* Quick Links */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 24 }}>
+        <QuickLink to="/admin/upload-pdf" title="Upload PDF" desc="Parse questions from ACT PDF files" />
+        <QuickLink to="/admin/questions" title="Manage Questions" desc="Add, edit, or delete questions in the bank" />
+        <QuickLink to="/admin/tests/create" title="Create Test" desc="Build a new test from the question bank" />
+      </div>
+
       {/* Stats Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 32 }}>
         <StatCard label="Questions" value={stats?.total_questions || 0} color="var(--act-blue)" />
@@ -459,12 +466,6 @@ export default function AdminDashboard() {
         </div>
       )}
 
-      {/* Quick Links */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16 }}>
-        <QuickLink to="/admin/questions" title="Manage Questions" desc="Add, edit, or delete questions in the bank" />
-        <QuickLink to="/admin/tests/create" title="Create Test" desc="Build a new test from the question bank" />
-        <QuickLink to="/admin/upload-pdf" title="Upload PDF" desc="Parse questions from ACT PDF files" />
-      </div>
     </div>
   );
 }
