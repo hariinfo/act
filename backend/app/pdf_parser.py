@@ -464,6 +464,29 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
         # Sort questions by number
         section_questions.sort(key=lambda q: q["question_number"])
 
+        # Deduplicate questions across pages (e.g. Science procedure steps 1-5
+        # can be parsed as questions on passage pages, duplicating real Q1-Q5).
+        # Prefer questions with real options over "(see image)" stubs.
+        seen_q = {}
+        for q in section_questions:
+            qn = q["question_number"]
+            if qn not in seen_q:
+                seen_q[qn] = q
+            else:
+                existing = seen_q[qn]
+                existing_is_stub = existing.get("option_a") == "(see image)"
+                new_is_stub = q.get("option_a") == "(see image)"
+                # Prefer real options over stubs
+                if existing_is_stub and not new_is_stub:
+                    seen_q[qn] = q
+                # If both are real, prefer the one with more option content
+                elif not existing_is_stub and not new_is_stub:
+                    existing_len = len(existing.get("option_a", "") or "")
+                    new_len = len(q.get("option_a", "") or "")
+                    if new_len > existing_len:
+                        seen_q[qn] = q
+        section_questions = sorted(seen_q.values(), key=lambda q: q["question_number"])
+
         # Associate questions with passages based on page ranges
         if passages:
             for q in section_questions:
@@ -496,10 +519,19 @@ def parse_act_pdf(pdf_bytes: bytes) -> dict:
                         q["passage_image"] = p["image"]
 
         # Render question images for Math section (preserves notation)
-        # Also render for Science questions that have diagrams/figures nearby
         if sec["name"] == "Math":
             _extract_math_shared_info(doc, section_questions, sec["start_page"], sec["end_page"])
             _render_question_images(doc, section_questions, sec["start_page"], sec["end_page"])
+
+        # Detect and render embedded tables/figures in Science and Reading questions
+        if sec["name"] in ("Science", "Reading"):
+            _render_embedded_content(doc, section_questions, sec["start_page"], sec["end_page"], sec["name"])
+            # Render question images for graphical-option questions (e.g. graph choices).
+            # Pass all questions for position boundaries, but only render stubs.
+            graph_q_nums = {q["question_number"] for q in section_questions if q.get("option_a") == "(see image)"}
+            if graph_q_nums:
+                _render_question_images(doc, section_questions, sec["start_page"], sec["end_page"],
+                                        only_q_nums=graph_q_nums)
 
         # Remove position metadata from output
         for q in section_questions:
@@ -1262,23 +1294,23 @@ def _parse_page_questions(page, page_text, page_num, section_name=None):
         # For Math questions with graphical answer options (e.g. graphs for
         # each choice), text option parsing fails.  Create a stub question
         # so the image renderer can still capture the visual options.
-        if q is None and section_name == "Mathematics" and len(clean.strip()) > 20:
+        if q is None and section_name in ("Mathematics", "Science") and len(clean.strip()) > 20:
             uses_fghj = q_num % 2 == 0
             q = {
                 "question_number": q_num,
                 "question_text": " ".join(clean.split()),
                 "correct_answer": None,
                 "option_labels": "FGHJK" if uses_fghj else "ABCDE",
-                "option_a": "(see image)" if not uses_fghj else "(see image)",
+                "option_a": "(see image)",
                 "option_b": "(see image)",
                 "option_c": "(see image)",
                 "option_d": "(see image)",
-                "option_e": "(see image)",
+                "option_e": None,
                 "passage_text": None,
                 "question_image": None,
                 "difficulty": 3,
             }
-            logger.info(f"[MathGraphQ] Q{q_num} has graphical options — created stub question")
+            logger.info(f"[GraphQ] Q{q_num} ({section_name}) has graphical options — created stub question")
 
         if q:
             # Find y position by scanning text blocks for lines starting with "N."
@@ -1300,8 +1332,14 @@ def _parse_page_questions(page, page_text, page_num, section_name=None):
                     # Must be below header
                     if by0 < header_threshold:
                         continue
-                    # English questions are in the right column; others in the left
-                    if section_name != "English" and bx0 > left_half:
+                    # English questions are in the right column; Math/Reading in the left
+                    # Science questions can be in either column
+                    if section_name == "English":
+                        if bx0 < left_half:
+                            continue
+                    elif section_name == "Science":
+                        pass  # accept blocks in either column
+                    elif bx0 > left_half:
                         continue
                     # Check if block text starts with the question number
                     block_text = ""
@@ -1319,7 +1357,7 @@ def _parse_page_questions(page, page_text, page_num, section_name=None):
                 # Fallback: use search_for with stricter filtering
                 search_str = f" {q_num}." if q_num < 10 else f"{q_num}."
                 rects = page.search_for(search_str)
-                if section_name == "English":
+                if section_name in ("English", "Science"):
                     valid_rects = [r for r in rects if r.y0 > header_threshold]
                 else:
                     valid_rects = [r for r in rects if r.y0 > header_threshold and r.x0 < left_half]
@@ -1388,6 +1426,17 @@ def _parse_question_block(q_num, text, page_num):
             letter = opt_match.group(1).upper()
             opt_text = opt_match.group(2).strip()
 
+            # If we already parsed this option letter, we've hit duplicate
+            # labels from trailing content (e.g. graph axis labels from a
+            # different question's images).  Stop parsing.
+            if letter in opts:
+                break
+
+            # If we already have all 4 required options (A-D or F-J),
+            # only accept option E/K; anything else is trailing noise.
+            if len(opts) >= 4 and letter not in ('E', 'K'):
+                break
+
             # If option text is empty or very short, grab next non-empty lines
             # ACT PDFs often put "A.  " then the value on the next line(s)
             if not opt_text:
@@ -1424,6 +1473,18 @@ def _parse_question_block(q_num, text, page_num):
             # vs start of question text for next question
             if re.match(r'^\d{1,2}\.\s', stripped):
                 break
+            # Once we have all 4 required options, only allow continuation
+            # if the current option text ends mid-sentence (e.g. "between 400 nm and").
+            # Otherwise, remaining lines are likely noise (graph axis labels, etc.).
+            if len(opts) >= 4:
+                last_word = opts[current_opt].rstrip('.').rsplit(None, 1)[-1].lower() if opts[current_opt].strip() else ""
+                mid_sentence = last_word in (
+                    'and', 'or', 'the', 'a', 'an', 'of', 'in', 'to', 'from',
+                    'for', 'by', 'is', 'was', 'be', 'that', 'than', 'with',
+                    'into', 'between', 'not', 'would', 'prevented',
+                )
+                if not mid_sentence:
+                    continue
             # Skip standalone numbers (1-75) — these are passage reference
             # numbers or question numbers leaking from the adjacent column
             if re.match(r'^\d{1,2}$', stripped) and 1 <= int(stripped) <= 75:
@@ -1461,6 +1522,9 @@ def _parse_question_block(q_num, text, page_num):
     # Clean up option text
     for k in opts:
         opts[k] = re.sub(r'\s+', ' ', opts[k]).strip()
+        # Fix PDF artifact: invisible "0," prefix on numbers < 1,000
+        # e.g. "0,200." → "200.", "0,300." → "300."
+        opts[k] = re.sub(r'^0,(\d)', r'\1', opts[k])
 
     # Map positionally: option_a = first label's value, etc.
     # Use extract_labels for lookup (matches parsed PDF letters),
@@ -1579,7 +1643,159 @@ def _extract_math_shared_info(doc, questions, start_page, end_page):
             logger.info(f"[MathSharedInfo] Attached shared info block to Q{q_start}-{q_end} (page {pg_idx + 1})")
 
 
-def _render_question_images(doc, questions, start_page, end_page):
+def _render_embedded_content(doc, questions, start_page, end_page, section_name="Science"):
+    """
+    Detect and render embedded content (tables, figures) within Science/Reading
+    questions where such content sits between the question text and answer options.
+
+    Text extraction captures the question text and options but loses table structure
+    (gridlines, alignment). This function finds those regions and renders them as
+    question_image so the frontend can display them inline.
+    """
+    if not questions:
+        return
+
+    # Group questions by page
+    by_page = {}
+    for q in questions:
+        pg = q.get("page_num")
+        if pg:
+            by_page.setdefault(pg, []).append(q)
+
+    for pg_num, page_questions in by_page.items():
+        pg_idx = pg_num - 1
+        if pg_idx < 0 or pg_idx >= len(doc):
+            continue
+
+        page = doc[pg_idx]
+        pw = page.rect.width
+        ph = page.rect.height
+        col_mid = pw * 0.5
+        blocks = _get_page_blocks(page)
+
+        # Sort questions on this page by y position
+        page_questions.sort(key=lambda q: q.get("y_pos", 0))
+
+        for i, q in enumerate(page_questions):
+            # Skip if already has a question_image
+            if q.get("question_image"):
+                continue
+
+            q_num = q.get("question_number", 0)
+            q_y = q.get("y_pos", 0)
+            q_x = q.get("x_pos", 0)
+
+            # Determine which column the question is in
+            is_right_col = q_x >= col_mid
+
+            # Find the y-extent of this question's region
+            # Must find next question in the SAME column (left vs right)
+            next_q_y = ph - 60  # default: stop before footer
+            for j in range(i + 1, len(page_questions)):
+                nq = page_questions[j]
+                nq_x = nq.get("x_pos", 0)
+                nq_in_right = nq_x >= col_mid
+                if nq_in_right == is_right_col:
+                    next_q_y = nq.get("y_pos", ph)
+                    break
+
+            # Two-pass approach: first find option blocks, then question text block
+            # Option pattern: "A." or "F." (may or may not have space after period)
+            opt_pattern = re.compile(r'^[A-KFGHJ]\.')
+            q_num_pattern = re.compile(rf'^\s*{q_num}\.\s')
+
+            q_text_bottom = q_y  # bottom of question text (just the Q number block)
+            first_opt_y = next_q_y  # y of first option
+
+            # Collect relevant blocks in this question's region and column
+            q_blocks = []
+            for b in blocks:
+                if b["type"] != 0:
+                    continue
+                bx0, by0, bx1, by1 = b["bbox"]
+                if by0 < q_y - 2 or by0 >= next_q_y:
+                    continue
+                if is_right_col and bx0 < col_mid:
+                    continue
+                if not is_right_col and bx0 >= col_mid:
+                    continue
+                block_text = ""
+                for bline in b["lines"]:
+                    for span in bline["spans"]:
+                        block_text += span["text"]
+                block_text = block_text.strip()
+                if not block_text:
+                    continue
+                if any(noise in block_text for noise in ['GO ON TO THE NEXT PAGE', 'ACT-', 'STOP!', 'DO NOT TURN', 'END OF TEST']):
+                    continue
+                q_blocks.append((bx0, by0, bx1, by1, block_text))
+
+            # Pass 1: find first option y
+            for bx0, by0, bx1, by1, block_text in q_blocks:
+                if opt_pattern.match(block_text):
+                    first_opt_y = min(first_opt_y, by0)
+
+            # Pass 2: find question number block bottom (the actual question text)
+            for bx0, by0, bx1, by1, block_text in q_blocks:
+                if q_num_pattern.match(block_text):
+                    q_text_bottom = max(q_text_bottom, by1)
+
+            # Now check if there's a gap between question text bottom and first option
+            # that might contain a table or figure
+            gap = first_opt_y - q_text_bottom
+            if gap < 30:
+                # No significant gap - no embedded content
+                continue
+
+            # Define the gap region
+            if is_right_col:
+                x_left = col_mid - 10
+                x_right = pw - 36
+            else:
+                x_left = 36
+                x_right = col_mid + 10
+
+            gap_rect = fitz.Rect(x_left, q_text_bottom - 2, x_right, first_opt_y - 2)
+
+            # Check if there are vector drawings (table gridlines) in this gap
+            has_drawings = _has_drawings_in_rect(page, gap_rect)
+
+            # Also check for table-like text content in the gap
+            # (multiple short text blocks at similar y positions = table rows)
+            gap_blocks = []
+            for b in blocks:
+                if b["type"] != 0:
+                    continue
+                bx0, by0, bx1, by1 = b["bbox"]
+                if by0 >= q_text_bottom - 2 and by1 <= first_opt_y + 2:
+                    if is_right_col and bx0 >= col_mid - 10:
+                        gap_blocks.append(b)
+                    elif not is_right_col and bx0 < col_mid + 10:
+                        gap_blocks.append(b)
+
+            # Heuristic: if there are drawings OR multiple text blocks in the gap,
+            # it's likely a table or structured content
+            has_table_content = has_drawings or len(gap_blocks) >= 2
+
+            if not has_table_content:
+                continue
+
+            # Render the gap region (table/figure only) as question_image
+            try:
+                # Use higher scale for narrow columns
+                clip_width = gap_rect.width
+                scale = max(2.5, 1350 / clip_width) if clip_width > 0 else 5.0
+                scale = min(scale, 5.0)
+
+                img_b64 = _render_region_to_base64(page, gap_rect, scale=scale)
+                q["question_image"] = img_b64
+                logger.info(f"[EmbeddedContent] Rendered table/figure for Q{q_num} on page {pg_num} "
+                           f"(gap={gap:.0f}px, drawings={has_drawings}, blocks={len(gap_blocks)})")
+            except Exception as e:
+                logger.warning(f"Failed to render embedded content for Q{q_num}: {e}")
+
+
+def _render_question_images(doc, questions, start_page, end_page, only_q_nums=None):
     """
     Render each question (text + options) as an image from the PDF.
     This preserves mathematical notation, fractions, superscripts, etc.
@@ -1587,6 +1803,9 @@ def _render_question_images(doc, questions, start_page, end_page):
 
     For each question, we find its bounding region on the page
     (from question start to next question start) and render as PNG.
+
+    If only_q_nums is set, only render questions with those numbers
+    (other questions are still used for position boundaries).
     """
     if not questions:
         return
@@ -1631,9 +1850,33 @@ def _render_question_images(doc, questions, start_page, end_page):
             # We'll set question_image only if it doesn't have one
             q_y_start = q.get("y_pos", 0)
 
-            # End y: either next question's y_pos or bottom of question content
-            if i + 1 < len(page_questions):
-                q_y_end = page_questions[i + 1].get("y_pos", ph) - 4
+            # For two-column Science pages, limit clip to the question's column
+            q_x_pos = q.get("x_pos", 0)
+            col_mid = pw * 0.5
+            if not has_figuring_area and q_x_pos < col_mid:
+                # Question is in left column — don't capture right column content
+                q_x_left = x_left
+                q_x_right = col_mid + 10
+            elif not has_figuring_area and q_x_pos >= col_mid:
+                q_x_left = col_mid - 10
+                q_x_right = pw - 36
+            else:
+                q_x_left = x_left
+                q_x_right = x_right
+
+            # End y: next question's y_pos IN THE SAME COLUMN, or content bottom.
+            # On two-column Science pages, questions in opposite columns at the
+            # same y should not limit each other's height.
+            q_in_left = q_x_pos < col_mid
+            next_same_col = None
+            for j in range(i + 1, len(page_questions)):
+                nq = page_questions[j]
+                nq_in_left = nq.get("x_pos", 0) < col_mid
+                if nq_in_left == q_in_left and nq.get("y_pos", 0) > q_y_start + 10:
+                    next_same_col = nq
+                    break
+            if next_same_col:
+                q_y_end = next_same_col.get("y_pos", ph) - 4
             else:
                 # Last question on page: find actual content bottom instead of
                 # extending to page bottom (which captures empty space)
@@ -1644,7 +1887,7 @@ def _render_question_images(doc, questions, start_page, end_page):
                         continue
                     bx0, by0, bx1, by1 = b["bbox"]
                     # Only blocks in the question column and below this question
-                    if bx0 > x_right or by0 < q_y_start:
+                    if bx0 > q_x_right or bx0 < q_x_left - 10 or by0 < q_y_start:
                         continue
                     # Skip footer/noise blocks
                     if by0 > ph - 60:
@@ -1672,8 +1915,12 @@ def _render_question_images(doc, questions, start_page, end_page):
             if q_y_end - q_y_start < 30:
                 continue
 
+            # Skip questions not in the render set (but keep them for boundaries)
+            if only_q_nums and q.get("question_number") not in only_q_nums:
+                continue
+
             # Render the question region
-            rect = fitz.Rect(x_left, q_y_start, x_right, q_y_end)
+            rect = fitz.Rect(q_x_left, q_y_start, q_x_right, q_y_end)
             try:
                 img_b64 = _render_region_to_base64(page, rect, scale=5.0)
                 q["question_image"] = img_b64

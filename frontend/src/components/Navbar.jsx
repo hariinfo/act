@@ -90,7 +90,13 @@ export default function Navbar() {
         {user && (
           <>
             <Link to="/tests" style={styles.link}>Tests</Link>
-            {isAdmin && <Link to="/admin" style={styles.link}>Admin</Link>}
+            {isAdmin && (
+              <>
+                <Link to="/admin/upload-pdf" style={styles.link}>Upload PDF</Link>
+                <Link to="/admin/questions" style={styles.link}>Manage Questions</Link>
+                <Link to="/admin/tests/create" style={styles.link}>Create Test</Link>
+              </>
+            )}
           </>
         )}
       </div>
